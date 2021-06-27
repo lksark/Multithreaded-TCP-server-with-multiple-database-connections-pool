@@ -1,0 +1,1251 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Threading;
+using System.Net;
+using System.Net.Sockets;
+using System.IO;
+using System.Data.Odbc;
+using System.Data.SqlClient;
+
+namespace web_DBserver
+{
+    class Program
+    {
+        static bool RunProgram = true;
+        static int worker_TCPServer_count = 4;
+        static int DB_connection_count = 4;
+
+        static class_mulithreading_Stack shared_worker_TCPServer_status;
+        static class_worker_TCP_Server[] object_worker_TCP_Server = new class_worker_TCP_Server[worker_TCPServer_count];
+        static class_Handshake_Passcode[] object_Handshake_Passcode = new class_Handshake_Passcode[worker_TCPServer_count];
+        static class_currTimeDate currTimeDate = new class_currTimeDate();
+        static class_check_connection_timeout object_check_connection_timeout = new class_check_connection_timeout(worker_TCPServer_count);
+        static class_worker_ReadDB_ConnectionPool[] object_worker_DBconnection_pool = new class_worker_ReadDB_ConnectionPool[DB_connection_count];
+        static class_mulithreading_Queue mulithreading_Queue_ReadDB = new class_mulithreading_Queue();
+
+        static void Main(string[] args)
+        {
+            Thread[] thread_DBconnection = new Thread[DB_connection_count];
+            for (int i = 0; i < DB_connection_count; i++)
+            {
+                object_worker_DBconnection_pool[i] = new class_worker_ReadDB_ConnectionPool(51000 + i);
+                thread_DBconnection[i] = new Thread(new ThreadStart(object_worker_DBconnection_pool[i].ReadWriteDB));
+                thread_DBconnection[i].Start();
+            }
+
+            shared_worker_TCPServer_status = new class_mulithreading_Stack();
+
+            Thread[] WorkerThreadsArray_TCP = new Thread[worker_TCPServer_count];
+            for (int i = 0; i < worker_TCPServer_count; i++)
+            {
+                object_Handshake_Passcode[i] = new class_Handshake_Passcode();
+
+                object_worker_TCP_Server[i] = new class_worker_TCP_Server(i, 50001 + i);
+
+                WorkerThreadsArray_TCP[i] = new Thread(new ThreadStart(object_worker_TCP_Server[i].RunServer));
+                WorkerThreadsArray_TCP[i].Start();
+            }
+
+            class_portal_TCP_Server object_portal_TCP = new class_portal_TCP_Server();
+            Thread PortalThread_TCP = new Thread(new ThreadStart(object_portal_TCP.RunServer));
+            PortalThread_TCP.Start();
+
+            Thread Thread_RTC_tick = new Thread(new ThreadStart(currTimeDate.TimerTick));
+            Thread_RTC_tick.Start();
+
+            Thread Thread_check_Connections_Timeout = new Thread(new ThreadStart(object_check_connection_timeout.check_timeout));
+            Thread_check_Connections_Timeout.Start();
+
+            Console.WriteLine("Waiting for connection");
+
+            foreach (Thread t in thread_DBconnection)
+                t.Join();
+            Thread_RTC_tick.Join();
+            Thread_check_Connections_Timeout.Join();
+            PortalThread_TCP.Join();
+            foreach (Thread t in WorkerThreadsArray_TCP)
+                t.Join();
+            // Join both threads with no timeout
+            // Run both until done.
+            // threads have finished at this point.
+        }
+
+        public class class_mulithreading_Stack
+        {
+            //This 'class_mulithreading_Stack' will not tell worker threads to idle when stack is empty
+            private Stack<int> Stack_multithreads;
+            private int TagNumber;
+            private bool isLocked;
+
+            public class_mulithreading_Stack()
+            {
+                isLocked = false;
+                Stack_multithreads = new Stack<int>();
+            }
+
+            public bool Any()
+            {
+                bool _Any;
+
+                Monitor.Enter(this);        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);     //enter WaitSleepJoin state
+
+                try
+                {
+                    isLocked = true;
+                    _Any = Stack_multithreads.Any();
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);     //release lock on this object
+                }
+
+                return _Any;
+            }
+
+            public void Push(int theTagNumber)
+            {
+                Monitor.Enter(this);        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);     //enter WaitSleepJoin state
+
+                try
+                {
+                    isLocked = true;
+                    if (!Stack_multithreads.Contains(theTagNumber))          //make sure duplicate TagNumber does not inserted into the stack
+                        Stack_multithreads.Push(theTagNumber);
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);     //release lock on this object
+                }
+            }
+
+            public Tuple<bool, int> Pop()
+            {
+                bool Any = false;
+
+                Monitor.Enter(this);        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);     //enter WaitSleepJoin state
+
+                try
+                {
+                    isLocked = true;
+
+                    if (Stack_multithreads.Any())
+                    {
+                        TagNumber = Stack_multithreads.Pop();
+                        Any = true;
+                    }
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);     //release lock on this object
+                }
+
+                //if no data from 'Stack_worker_TCPServer_listening', return false. Else return true.
+                return new Tuple<bool, int>(Any, TagNumber);
+            }
+        }
+
+        public class class_currTimeDate
+        {
+            //This class "class_currTimeDate" is for simulation purpose only
+            //Assuming class_currTimeDate is an accurate system clock, TimerTick() is hardware time ticking
+            private DateTime curr_DateTime;
+            private bool isLocked;
+
+            public class_currTimeDate()
+            {
+                curr_DateTime = DateTime.Now;
+                isLocked = false;
+            }
+
+            public void TimerTick()
+            {
+                while (RunProgram)
+                {
+                    Thread.Sleep(1000);
+
+                    Monitor.Enter(this);            //obtain lock on this object
+                    if (isLocked)
+                        Monitor.Wait(this);                 //enter WaitSleepJoin state
+                    isLocked = true;
+
+                    curr_DateTime = curr_DateTime.AddSeconds(1);
+
+                    isLocked = false;
+                    Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);             //release lock on this object
+
+                    object_check_connection_timeout.notify_timed();
+                }
+            }
+
+            public DateTime get_curr_DateTime()
+            {
+                DateTime _curr_DateTime;
+
+                Monitor.Enter(this);            //obtain lock on this object
+                if (isLocked)
+                    Monitor.Wait(this);                 //enter WaitSleepJoin state
+                isLocked = true;
+
+                _curr_DateTime = curr_DateTime;
+
+                isLocked = false;
+                Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                Monitor.Exit(this);             //release lock on this object
+
+                return _curr_DateTime;
+            }
+        }
+
+        // this class is to generate random handshaking code for client to connect to worker server
+        // when new connection, new handshaking code
+        // if worker server received wrong handshake code from client, connection will be closed.
+        public class class_Handshake_Passcode
+        {
+            private int Handshake_Passcode;
+            private bool isLocked;
+
+            public class_Handshake_Passcode()
+            {
+                isLocked = false;
+
+                Random myRandom = new Random();
+                Handshake_Passcode = myRandom.Next(100);
+            }
+
+            public void set_Handshake_Passcode()
+            {
+                Random myRandom = new Random();
+
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                Handshake_Passcode = myRandom.Next(100);
+
+                isLocked = false;
+                Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                Monitor.Exit(this);                     //release lock on this object
+            }
+
+            public int get_Handshake_Passcode()
+            {
+                int _Handshake_Passcode;
+
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                _Handshake_Passcode = Handshake_Passcode;
+
+                isLocked = false;
+                Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                Monitor.Exit(this);                     //release lock on this object
+
+                return _Handshake_Passcode;
+            }
+        }
+
+        class class_check_connection_timeout
+        {
+            //This struct will check timeout of waiting pre-assigned clients to connect to worker web servers
+            struct struct_worker_TCPServer_timeout_WaitConnection
+            {
+                private bool isWaitingClientConnection;
+                private DateTime DateTime_timeout;
+
+                public struct_worker_TCPServer_timeout_WaitConnection(bool _isWaitingConnection)
+                {
+                    isWaitingClientConnection = _isWaitingConnection;
+                    DateTime_timeout = DateTime_Now;
+                }
+
+                public void set_timeout_WaitingClientConnection()
+                {
+                    isWaitingClientConnection = true;
+                    DateTime_timeout = DateTime_Now.AddSeconds(2);
+                }
+
+                public bool get_timeout_WaitingClientConnection()
+                {
+
+                    if (DateTime.Compare(DateTime_Now, DateTime_timeout) > 0)
+                    {
+                        isWaitingClientConnection = false;
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                public void remove_timeout_WaitingClientConnection()
+                {
+                    isWaitingClientConnection = false;
+                }
+
+                public bool get_isWaitingClientConnection()
+                {
+                    return isWaitingClientConnection;
+                }
+            }
+
+            //This struct will check timeout of clients after they are connected to worker web servers
+            struct struct_worker_TCPServer_timeout_IdleConnection_TotalConnectedTime
+            {
+                private bool isConnected;
+                private DateTime DateTime_Timeout_IdleConnection;
+                private DateTime DateTime_Timeout_TotalConnectedTime;
+
+                public struct_worker_TCPServer_timeout_IdleConnection_TotalConnectedTime(bool _isConnected)
+                {
+                    isConnected = _isConnected;
+                    DateTime_Timeout_IdleConnection = DateTime_Now;
+                    DateTime_Timeout_TotalConnectedTime = DateTime_Now;
+                }
+
+                public void set_timeout_IdleConnection(int timeout_period)
+                {
+                    isConnected = true;
+                    DateTime_Timeout_IdleConnection = DateTime_Now.AddSeconds(timeout_period);
+                }
+
+                public bool get_timeout_IdleConnection()
+                {
+                    if (DateTime.Compare(DateTime_Now, DateTime_Timeout_IdleConnection) > 0)
+                    {
+                        isConnected = false;
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                public void set_timeout_TotalConnectedTime(int timeout_period)
+                {
+                    isConnected = true;
+                    DateTime_Timeout_TotalConnectedTime = DateTime_Now.AddSeconds(timeout_period);
+                }
+
+                public bool get_timeout_TotalConnectedTime()
+                {
+                    if (DateTime.Compare(DateTime_Now, DateTime_Timeout_TotalConnectedTime) > 0)
+                    {
+                        isConnected = false;
+                        return true;
+                    }
+
+                    return false;
+                }
+
+                public void remove_isConnected()
+                {
+                    isConnected = false;
+                }
+
+                public bool get_isConnected()
+                {
+                    return isConnected;
+                }
+            }
+
+            private bool isLocked;
+            private bool is_RTC_interrupt;
+            private static DateTime DateTime_Now;
+            private struct_worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[] worker_TCPServer_timeout_IdleConnection_TotalConnectedTime;
+            private struct_worker_TCPServer_timeout_WaitConnection[] worker_TCPServer_timeout_WaitingClientConnection;
+            private int Worker_TCPServer_count;
+
+            public class_check_connection_timeout(int _worker_TCPServer_count)
+            {
+                isLocked = false;
+                is_RTC_interrupt = false;
+                DateTime_Now = DateTime.Now;
+
+                Worker_TCPServer_count = _worker_TCPServer_count;
+                worker_TCPServer_timeout_IdleConnection_TotalConnectedTime = new struct_worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[Worker_TCPServer_count];
+                worker_TCPServer_timeout_WaitingClientConnection = new struct_worker_TCPServer_timeout_WaitConnection[Worker_TCPServer_count];
+                for (int i = 0; i < Worker_TCPServer_count; i++)
+                {
+                    worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[i] = new struct_worker_TCPServer_timeout_IdleConnection_TotalConnectedTime(false);
+                    worker_TCPServer_timeout_WaitingClientConnection[i] = new struct_worker_TCPServer_timeout_WaitConnection(false);
+                }
+            }
+
+            public void notify_timed()
+            {
+                Monitor.Enter(this);            //obtain lock on this object
+                if (isLocked)
+                    Monitor.Wait(this);                 //enter WaitSleepJoin state
+                isLocked = true;
+
+                DateTime_Now = DateTime.Now;
+                is_RTC_interrupt = true;
+
+                isLocked = false;
+                Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                Monitor.Exit(this);             //release lock on this object
+            }
+
+            public void check_timeout()
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                while (RunProgram)
+                {
+                    if (!is_RTC_interrupt)
+                        Monitor.Wait(this);
+
+                    //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                    if (isLocked)
+                        Monitor.Wait(this);                     //enter WaitSleepJoin state
+                    isLocked = true;
+
+                    try
+                    {
+                        if (is_RTC_interrupt)
+                        {
+                            for (int i = 0; i < Worker_TCPServer_count; i++)
+                            {
+                                if (worker_TCPServer_timeout_WaitingClientConnection[i].get_isWaitingClientConnection())
+                                {
+                                    if (worker_TCPServer_timeout_WaitingClientConnection[i].get_timeout_WaitingClientConnection())       // if current port number timeout in waiting for expected client to connect
+                                    {
+                                        object_Handshake_Passcode[i].set_Handshake_Passcode();
+                                        shared_worker_TCPServer_status.Push(i);
+                                    }
+                                }
+                                else
+                                {
+                                    if (worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[i].get_isConnected())
+                                    {
+                                        if (worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[i].get_timeout_IdleConnection())       // if current port number client connection idle too long, timeout
+                                        {
+                                            worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[i].remove_isConnected();
+                                            object_worker_TCP_Server[i].close_connection("IDLE TIMEOUT");
+                                        }
+                                        else
+                                        {
+                                            if (worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[i].get_timeout_TotalConnectedTime())       // if current port number client total connected time too long, timeout
+                                            {
+                                                worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[i].remove_isConnected();
+                                                object_worker_TCP_Server[i].close_connection("TOTAL TIME TIMEOUT");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            is_RTC_interrupt = false;
+                        }
+                    }
+                    finally
+                    {
+                        isLocked = false;
+                        Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    }
+                }
+
+                Monitor.Exit(this);                     //release lock on this object
+            }
+
+            public void set_timeout_WaitingConnection(int workerTCPserverID)
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    worker_TCPServer_timeout_WaitingClientConnection[workerTCPserverID].set_timeout_WaitingClientConnection();
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                     //release lock on this object
+                }
+            }
+
+            public void remove_WaitingConnections(int workerTCPserverID)
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    worker_TCPServer_timeout_WaitingClientConnection[workerTCPserverID].remove_timeout_WaitingClientConnection();
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                     //release lock on this object
+                }
+            }
+
+            public void set_timeout_IdleConnection(int workerTCPserverID, int timeout_period)
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[workerTCPserverID].set_timeout_IdleConnection(timeout_period);
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                     //release lock on this object
+                }
+            }
+
+            public void set_timeout_TotalConnectedTime(int workerTCPserverID, int timeout_period)
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[workerTCPserverID].set_timeout_TotalConnectedTime(timeout_period);
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                     //release lock on this object
+                }
+            }
+
+            public void remove_isConnected(int workerTCPserverID)
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                     //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    worker_TCPServer_timeout_IdleConnection_TotalConnectedTime[workerTCPserverID].remove_isConnected();
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                    //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                     //release lock on this object
+                }
+            }
+        }
+
+        public class class_worker_TCP_Server
+        {
+            private Socket connection;              // Socket for accepting a connection
+            private NetworkStream socketStream;     // network data stream
+            private BinaryWriter writer;            // facilitates writing to the stream
+            private BinaryReader reader;            // facilitates reading from the stream
+            private TcpListener listener;
+            public int port_number;
+            public int HandshakePasscode;
+            private int worker_TCP_Server_ID;
+
+            private bool isLocked;
+            
+            private string sql;
+            private string DB_result;
+
+            public class_worker_TCP_Server(int ID, int portNumber)
+            {
+                // Step 1: create TcpListener
+                IPAddress local = IPAddress.Parse("127.0.0.1");
+                listener = new TcpListener(local, portNumber);
+                port_number = portNumber;
+                HandshakePasscode = 0;                              //Should generate random Handshake Code.
+                worker_TCP_Server_ID = ID;
+
+                isLocked = false;
+
+                sql = "";
+                DB_result = "";
+            }
+
+            // allow a client to connect; displays text the client sends
+            public void RunServer()
+            {
+                while (RunProgram)
+                {
+                    // wait for a client connection and display the text that the client sends
+                    try
+                    {
+                        // Step 2: TcpListener waits for connection request
+                        listener.Start();
+
+                        // Step 3: establish connection upon client request
+                        // accept an incoming connection
+                        connection = listener.AcceptSocket();
+
+                        // create NetworkStream object associated with socket
+                        socketStream = new NetworkStream(connection);
+
+                        // create objects for transferring data across stream
+                        writer = new BinaryWriter(socketStream);
+                        reader = new BinaryReader(socketStream);
+
+                        object_check_connection_timeout.remove_WaitingConnections(worker_TCP_Server_ID);
+
+                        IPEndPoint ep = connection.RemoteEndPoint as IPEndPoint;
+                        if (ep != null)
+                            Console.WriteLine("worker port " + port_number + " connected to client wih IP " + ep.Address.ToString());
+
+                        string theReply = "";
+                        HandshakePasscode = object_Handshake_Passcode[worker_TCP_Server_ID].get_Handshake_Passcode();
+
+                        // read handshaking passcode sent from client to worker server. Client must send handshake passcode to server within 1 second, or else worker server will close this connection.
+                        object_check_connection_timeout.set_timeout_IdleConnection(worker_TCP_Server_ID, 1);
+                        theReply = reader.ReadString();
+
+                        // If HandshakePasscode sent by TCP client tally with worker TCP server.
+                        if (theReply == "CLIENT" + port_number + ">>>HandshakeCode=" + HandshakePasscode)
+                        {
+                            // inform client that connection was successful
+                            writer.Write("SERVER" + port_number + ">>> Connected");
+                            if (ep != null)
+                                Console.WriteLine("worker port " + port_number + " handshake with client IP " + ep.Address.ToString() + " successful.");
+
+                            // Worker server only allows client to be continously connected to worker server for 10 mins. After 10 mins, worker server disconnects the client even client is active in communication.
+                            object_check_connection_timeout.set_timeout_TotalConnectedTime(worker_TCP_Server_ID, 600);
+
+                            // Step 4: read string data sent from client
+                            try
+                            {
+                                // client if idle more than 1 minute and not sending data to worker server, worker server close the connection.
+                                object_check_connection_timeout.set_timeout_IdleConnection(worker_TCP_Server_ID, 60);
+
+                                // read the string sent to the server
+                                theReply = reader.ReadString();
+
+                                // display the message
+                                Console.WriteLine("\r\n" + theReply);
+
+                                if (theReply != "CLIENT>>> TERMINATE")
+                                {
+                                    if (theReply.StartsWith("FIND:"))
+                                    {
+                                        theReply = theReply.Remove(0, 5);
+                                        if (theReply.StartsWith("EmployeeID="))
+                                        {
+                                            theReply = theReply.Remove(0, 11);
+                                            sql = "SELECT * FROM [schm_employee_attendance].[EmployeeAttendance] WHERE [EmployeeID]='" + theReply + "';";
+
+                                            mulithreading_Queue_ReadDB.Enqueue(port_number, true, sql);
+
+                                            Monitor.Enter(this);                        //obtain lock on this object
+
+                                            // wait for 'object_worker_DBconnection_pool' to return the SQL result
+                                            Monitor.Wait(this);                     //enter WaitSleepJoin state
+
+                                            if (isLocked)
+                                                Monitor.Wait(this);                 //enter WaitSleepJoin state
+                                            isLocked = true;
+
+                                            try
+                                            {
+                                                if (DB_result == "")
+                                                    server_send_text("NULL");
+                                                else
+                                                    server_send_text(DB_result);
+                                            }
+                                            finally
+                                            {
+                                                isLocked = false;
+                                                Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                                                Monitor.Exit(this);                         //release lock on this object
+                                            }
+                                        }
+                                    }
+                                    else if (theReply.StartsWith("INSERT:"))
+                                    {
+                                        theReply = theReply.Remove(0, 7);
+
+                                        string[] ColumnName_Data = theReply.Split(';');
+                                        string[,] matrix_ColumnName_Data = new string[ColumnName_Data.Count(), 2];
+                                        for (int i = 0; i < ColumnName_Data.Count(); i++)
+                                        {
+                                            string[] temp_ColumnName_Data = ColumnName_Data[i].Split('=');
+                                            matrix_ColumnName_Data[i, 0] = temp_ColumnName_Data[0];
+                                            matrix_ColumnName_Data[i, 1] = temp_ColumnName_Data[1];
+                                        }
+
+                                        sql = "INSERT INTO [schm_employee_attendance].[EmployeeAttendance] (";
+                                        for (int i = 0; i < ColumnName_Data.Count(); i++)
+                                            sql += matrix_ColumnName_Data[i, 0] + ",";
+                                        sql = sql.Substring(0, sql.Length - 1);
+                                        sql += ") VALUES ('";
+                                        sql += matrix_ColumnName_Data[0, 1] + "', CURRENT_TIMESTAMP);";
+                                        Console.WriteLine(sql);
+
+                                        mulithreading_Queue_ReadDB.Enqueue(port_number, false, sql);
+
+                                        Monitor.Enter(this);                        //obtain lock on this object
+
+                                        // wait for 'object_worker_DBconnection_pool' to return the read SQL result
+                                        Monitor.Wait(this);                     //enter WaitSleepJoin state
+
+                                        if (isLocked)
+                                            Monitor.Wait(this);                 //enter WaitSleepJoin state
+                                        isLocked = true;
+
+                                        try
+                                        {
+                                            server_send_text(DB_result);
+                                        }
+                                        finally
+                                        {
+                                            isLocked = false;
+                                            Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                                            Monitor.Exit(this);                         //release lock on this object
+                                        }
+                                    }
+                                    else if (theReply.StartsWith("UPDATE:"))
+                                    {
+                                        theReply = theReply.Remove(0, 7);
+
+                                        string[] ColumnName_Data = theReply.Split(';');
+                                        string[,] matrix_ColumnName_Data = new string[ColumnName_Data.Count(), 2];
+                                        for (int i = 0; i < ColumnName_Data.Count(); i++)
+                                        {
+                                            string[] temp_ColumnName_Data = ColumnName_Data[i].Split('=');
+                                            matrix_ColumnName_Data[i, 0] = temp_ColumnName_Data[0];
+                                            matrix_ColumnName_Data[i, 1] = temp_ColumnName_Data[1];
+                                        }
+
+                                        bool isRecordExist_db = false;
+
+                                        // check if there is a existing record in the database
+                                        sql = "SELECT [EntryTime] FROM [schm_employee_attendance].[EmployeeAttendance] " +
+                                            "WHERE [EmployeeID] = '" + matrix_ColumnName_Data[1, 1] + "' AND [EntryTime] IS NOT NULL AND [EntryTime] > (SELECT DATEADD(day, -1, getdate())) AND [ExitTime] IS NULL;";
+                                        //"WHERE [EmployeeID] = '" + matrix_ColumnName_Data[1, 1] + "';";
+                                        mulithreading_Queue_ReadDB.Enqueue(port_number, false, sql);
+
+                                        Monitor.Enter(this);                        //obtain lock on this object
+
+                                        // wait for 'object_worker_DBconnection_pool' to return the SQL result
+                                        Monitor.Wait(this);                     //enter WaitSleepJoin state
+
+                                        if (isLocked)
+                                            Monitor.Wait(this);                 //enter WaitSleepJoin state
+                                        isLocked = true;
+
+                                        try
+                                        {
+                                            if (DB_result == "")
+                                                isRecordExist_db = false;
+                                            else
+                                                isRecordExist_db = true;
+                                        }
+                                        finally
+                                        {
+                                            isLocked = false;
+                                            Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                                            Monitor.Exit(this);                         //release lock on this object
+                                        }
+
+                                        if (isRecordExist_db)         // When there is a existing record in the database, can update this record
+                                        {
+                                            Console.WriteLine(DB_result);
+                                            sql = "UPDATE [schm_employee_attendance].[EmployeeAttendance] " +
+                                            "SET [" + matrix_ColumnName_Data[1, 0] + "] = CURRENT_TIMESTAMP " +
+                                            "WHERE [" + matrix_ColumnName_Data[0, 0] + "] = '" + matrix_ColumnName_Data[0, 1] + "';";
+
+
+                                            Console.WriteLine(sql);
+
+                                            mulithreading_Queue_ReadDB.Enqueue(port_number, false, sql);
+
+                                            Monitor.Enter(this);                        //obtain lock on this object
+
+                                            // wait for 'object_worker_DBconnection_pool' to return the read SQL result
+                                            Monitor.Wait(this);                     //enter WaitSleepJoin state
+
+                                            if (isLocked)
+                                                Monitor.Wait(this);                 //enter WaitSleepJoin state
+                                            isLocked = true;
+
+                                            try
+                                            {
+                                                server_send_text(DB_result);
+                                            }
+                                            finally
+                                            {
+                                                isLocked = false;
+                                                Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                                                Monitor.Exit(this);                         //release lock on this object
+                                            }
+                                        }
+                                        else
+                                            server_send_text("NO_RECORD");      // When there is no existing record in the database, inform client
+                                    }
+                                    else
+                                        ;
+
+                                }
+                            }
+                            catch (Exception _error)
+                            {
+                                // handle exception if error reading data
+                                Console.WriteLine(_error.ToString());
+                            }
+                            finally
+                            {
+                                server_send_text("SERVER>>> TERMINATE");
+                            }
+                        }
+                        else
+                        {
+                            // If TCP client's handshake passcode does not tally with worker TCP server. Or client sending other irrelevant info but not handshake passcode.
+                            // client only has one chance sends the correct handshake passcode.
+                            if (theReply != "")
+                                server_send_text("SERVER" + port_number + ">>> Wrong handshake passcode");
+                        }
+
+                        if (theReply == "CLIENT>>> TERMINATE")
+                            Console.WriteLine("\r\nUser terminated connection on port " + port_number);
+                    }
+                    catch (Exception error)
+                    {
+                        Console.WriteLine(error.ToString());
+                        Thread.Sleep(100);
+                    }
+                    finally
+                    {
+                        // Step 5: close connection
+                        writer.Close();
+                        reader.Close();
+                        socketStream.Close();
+                        connection.Close();
+                        Console.WriteLine("\r\nworker port " + port_number + " terminated.");
+
+                        object_Handshake_Passcode[port_number - 50001].set_Handshake_Passcode();    // Worker server change to new handshake passcode whenever closing the current connection.
+                        object_check_connection_timeout.remove_isConnected(worker_TCP_Server_ID);
+                        shared_worker_TCPServer_status.Push(port_number);         //This worker TCP server is available to receive new incoming TCP client connection.
+                    }
+                }
+            }
+
+            public void RW_DB_result(string _DB_result)
+            {
+                Monitor.Enter(this);                        //obtain lock on this object
+                if (isLocked)
+                    Monitor.Wait(this);                 //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    DB_result = _DB_result;
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                         //release lock on this object
+                }
+            }
+
+            public void server_send_text(string SendText)
+            {
+                if (connection != null && connection.Connected)
+                    writer.Write(SendText);
+            }
+
+            public void close_connection(string message_to_client)
+            {
+                if (connection != null && connection.Connected)
+                    writer.Write("SERVER>>> " + message_to_client);
+
+                writer.Close();
+                reader.Close();
+                socketStream.Close();
+                connection.Close();
+
+                Console.WriteLine("\r\nWorker Server port " + port_number + " disconnected due to " + message_to_client);
+            }
+        }
+
+        public class class_portal_TCP_Server
+        {
+            private Socket connection;              // Socket for accepting a connection
+            private NetworkStream socketStream;     // network data stream
+            private BinaryWriter writer;            // facilitates writing to the stream
+            private BinaryReader reader;            // facilitates reading from the stream
+            private TcpListener listener;
+            public int port_number;
+
+            public class_portal_TCP_Server()
+            {
+                // Step 1: create TcpListener
+                IPAddress local = IPAddress.Parse("127.0.0.1");
+                listener = new TcpListener(local, 50000);
+                port_number = 50000;
+
+                for (int i = 0; i < worker_TCPServer_count; i++)
+                    shared_worker_TCPServer_status.Push(i + 50001);
+            }
+
+            // allow a client to connect; displays text the client sends
+            public void RunServer()
+            {
+                while (RunProgram)
+                {
+                    // wait for a client connection and display the text that the client sends
+                    try
+                    {
+                        // Step 2: TcpListener waits for connection request
+                        listener.Start();
+
+                        // Step 3: establish connection upon client request
+                        // accept an incoming connection
+                        connection = listener.AcceptSocket();
+
+                        // create NetworkStream object associated with socket
+                        socketStream = new NetworkStream(connection);
+
+                        // create objects for transferring data across stream
+                        writer = new BinaryWriter(socketStream);
+                        reader = new BinaryReader(socketStream);
+
+                        // inform client to switch-over from master_TCP connection to idle worker_TCP connection
+                        if (shared_worker_TCPServer_status.Any())
+                        {
+                            Tuple<bool, int> worker_TCP_port = shared_worker_TCPServer_status.Pop();
+                            if (worker_TCP_port.Item1)
+                            {
+                                object_check_connection_timeout.set_timeout_WaitingConnection(worker_TCP_port.Item2 - 50001);
+                                writer.Write("SERVER>>>Port=>" + worker_TCP_port.Item2 + ",HandshakeCode=" + object_Handshake_Passcode[worker_TCP_port.Item2 - 50001].get_Handshake_Passcode());
+                                //Console.WriteLine("\r\nAssigned to port " + worker_TCP_port.Item2);
+                            }
+                            else
+                                writer.Write("SERVER>>> FULL");
+                        }
+                        else
+                            writer.Write("SERVER>>> FULL");
+
+                        // Step 5: close connection
+                        writer.Close();
+                        reader.Close();
+                        socketStream.Close();
+                        connection.Close();
+
+                    }
+                    catch (Exception error)
+                    {
+                        Console.WriteLine(error.ToString());
+                        Thread.Sleep(100);
+                    }
+                }
+            }
+
+            public void server_send_text(string SendText)
+            {
+                if (connection.Connected)
+                    writer.Write(SendText);
+            }
+
+            public void close_connection()
+            {
+                writer.Close();
+                reader.Close();
+                socketStream.Close();
+                connection.Close();
+            }
+        }
+
+        public class class_mulithreading_Queue
+        {
+            //this class_mulithreading_Queue will inform worker threads to enter WaitSleepJoin state to idle when queue is empty
+            //Idle worker thread will become running state when new workload tag is added into the queue and invoke this worker thread.
+            private Queue<Tuple<int, bool, string>> Queue_multithreads;
+            private bool isLocked;
+
+            public class_mulithreading_Queue()
+            {
+                isLocked = false;
+                Queue_multithreads = new Queue<Tuple<int, bool, string>>();
+            }
+
+            public bool Any()
+            {
+                bool _Any;
+
+                Monitor.Enter(this);                    //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                 //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    _Any = Queue_multithreads.Any();
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                 //release lock on this object
+                }
+
+                return _Any;
+            }
+
+            public void Enqueue(int webServer_port, bool isExecuteReader, string str_sql)
+            {
+                Monitor.Enter(this);                            //obtain lock on this object
+
+                //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                if (isLocked)
+                    Monitor.Wait(this);                         //enter WaitSleepJoin state
+                isLocked = true;
+
+                try
+                {
+                    Queue_multithreads.Enqueue(new Tuple<int, bool, string>(webServer_port, isExecuteReader, str_sql));
+                }
+                finally
+                {
+                    isLocked = false;
+                    Monitor.Pulse(this);                        //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    Monitor.Exit(this);                         //release lock on this object
+                }
+            }
+
+            public Tuple<int, bool, string> Dequeue()
+            {
+                bool Any = false;
+                Tuple<int, bool, string> _tuple = new Tuple<int, bool, string>(-1, false, "") ;
+
+                Monitor.Enter(this);                            //obtain lock on this object
+                while (!Any && RunProgram)
+                {
+                    if (!Queue_multithreads.Any())
+                        Monitor.Wait(this);
+
+                    //if other thread is at present reading / editing this object (isLocked == true), place invoking thread in WaitSleepJoin state
+                    if (isLocked)
+                        Monitor.Wait(this);                     //enter WaitSleepJoin state
+                    isLocked = true;
+
+                    try
+                    {
+                        if (Queue_multithreads.Any())
+                        {
+                            _tuple = Queue_multithreads.Dequeue();
+                            Any = true;
+                        }
+                    }
+                    finally
+                    {
+                        isLocked = false;
+                        if (Queue_multithreads.Any())
+                            Monitor.Pulse(this);                //tell waiting thread(if there is one) to become ready to execute (Running state)
+                    }
+                }
+                Monitor.Exit(this);                             //release lock on this object
+
+                return _tuple;
+            }
+
+            public void Pulse()
+            {
+                Monitor.Enter(this);                            //obtain lock on this object
+                if (isLocked)
+                    Monitor.Wait(this);                         //enter WaitSleepJoin state
+                isLocked = false;
+                Monitor.Pulse(this);                            //tell waiting thread(if there is one) to become ready to execute (Running state)
+                Monitor.Exit(this);                             //release lock on this object
+            }
+        }
+
+        class class_worker_ReadDB_ConnectionPool
+        {
+            //private string connetionString = null;
+            private OdbcConnection cn;
+            private OdbcCommand cmd;
+            private string sql = null;
+            OdbcDataReader DbReader;
+            private int port_number;
+
+            private int errorCount_SQLconnection;
+
+            Tuple<int, bool, string> WebServerPort_SQL;
+            private int DB_FieldCount;
+
+            public class_worker_ReadDB_ConnectionPool(int _port_number)
+            {
+                port_number = _port_number;
+
+                //connetionString = @"Driver={SQL Server};Server=localhost\INSTANCE_KS;UID=abc;PWD=abc123;Database=Books_ExerciseKS;";
+                //connetionString = @"Driver={SQL Server};Server=localhost\INSTANCE_KS;PORT=48030;USER=abc;PASSWORD=abc123;Database=Books_ExerciseKS;";
+                string connetionString = @"Driver={SQL Server};Server=localhost\INSTANCE_KS;USER=abc;PASSWORD=abc123;Database=db_Employee_Attendance;PORT=" + port_number + ";";
+                cn = new OdbcConnection(connetionString);
+
+                errorCount_SQLconnection = 0;
+
+                sql = "";
+                WebServerPort_SQL = new Tuple<int, bool, string>(-1, false, "");
+            }
+
+            public void ReadWriteDB()
+            {
+                string str_DB_output = "";
+                DateTime datetime_LastConnection = DateTime.Now;
+
+                while (RunProgram && errorCount_SQLconnection < 10)
+                {
+                    try
+                    {
+                        datetime_LastConnection = DateTime.Now;
+
+                        cn.Open();
+                        Console.WriteLine("Open DB connection on port " + port_number);
+
+                        while (cn.State == System.Data.ConnectionState.Open)
+                        {
+                            // mulithreading_Queue_ReadDB will make current thread idle in wait state if this queue is empty, wait until new workloads added into the queue.
+                            WebServerPort_SQL = mulithreading_Queue_ReadDB.Dequeue();
+
+                            if (WebServerPort_SQL.Item3 != "")
+                            {
+                                try
+                                {
+                                    cmd = new OdbcCommand(WebServerPort_SQL.Item3, cn);
+
+                                    if (WebServerPort_SQL.Item2)                // WebServerPort_SQL.Item2 == TRUE when read DB
+                                    {
+                                        // Read data from database, send data to web server by port number who requested the data.
+                                        // Later the web server will forward the data to the client who requested the data.
+
+                                        DbReader = cmd.ExecuteReader();
+                                        DB_FieldCount = DbReader.FieldCount;
+
+                                        while (DbReader.Read())
+                                        {
+                                            //str_DB_output = DbReader.GetString(0);
+                                            /*
+                                            foreach (var record in DbReader)
+                                                str_DB_output += record.ToString() + ";";
+                                            */
+
+                                            for (int i = 0; i < DB_FieldCount; i++)
+                                            {
+                                                if (DbReader[i].ToString() != "")
+                                                    str_DB_output += DbReader[i].ToString() + ";";
+                                                else
+                                                    str_DB_output += " ;";
+                                            }
+
+                                            str_DB_output += "\n";
+                                        }
+
+                                        DbReader.Close();
+                                        cmd.Dispose();
+
+                                    }
+                                    else
+                                    {
+                                        // WebServerPort_SQL.Item2 == FALSE when read DB
+                                        // Write data into DB. If successful, callback 'INSERTED'. Else callback 'ERROR:'
+                                        cmd.ExecuteNonQuery();
+                                        str_DB_output = "INSERTED";
+                                    }
+                                }
+                                catch (SqlException ex)
+                                {
+                                    str_DB_output = "ERROR: ";
+                                    for (int i = 0; i < ex.Errors.Count; i++)
+                                    {
+                                        str_DB_output += "Index #" + i + "\n" +
+                                            "Message: " + ex.Errors[i].Message + "\n" +
+                                            "LineNumber: " + ex.Errors[i].LineNumber + "\n" +
+                                            "Source: " + ex.Errors[i].Source + "\n" +
+                                            "Procedure: " + ex.Errors[i].Procedure + "\n";
+                                    }
+                                }
+                                finally
+                                {
+                                    Console.WriteLine("DB port " + port_number + ": " + str_DB_output);
+
+                                    if (WebServerPort_SQL.Item1 != -1)
+                                        object_worker_TCP_Server[WebServerPort_SQL.Item1 - 50001].RW_DB_result(str_DB_output);
+
+                                    str_DB_output = "";
+                                    sql = "";
+                                    WebServerPort_SQL = new Tuple<int, bool, string>(-1, false, "");
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        Console.WriteLine(error.ToString());
+                    }
+                    finally
+                    {
+                        cn.Close();
+
+                        // If the DB connection do not alive more than 10 seconds, considered as an error connection. Increase the error count.
+                        if (DateTime.Now.Subtract(datetime_LastConnection).TotalMinutes < 1)
+                            errorCount_SQLconnection++;
+                    }
+                }
+
+                Thread.Sleep(1000);
+
+                if (errorCount_SQLconnection == 10)
+                    Console.WriteLine("DB connection of port " + port_number + " has accumulate error count of 10"); 
+            }
+        }
+    }
+}
